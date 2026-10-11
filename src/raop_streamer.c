@@ -936,16 +936,50 @@ static short *_buffer_get_frame(raopst_t *ctx, size_t *bytes) {
 }
 
 /*---------------------------------------------------------------------------*/
+static int send_all(int sock, const void *data, int size, int flags) {
+	int offset = 0;
+	while (offset < size) {
+		int sent = send(sock, (const char*) data + offset, size - offset, flags);
+		if (sent > 0) {
+			offset += sent;
+			continue;
+		}
+		if (!sent) return -1;
+		int error = last_error();
+#if WIN
+		if (error == WSAEINTR) continue;
+#else
+		if (error == EINTR) continue;
+#endif
+		if (error != ERROR_WOULDBLOCK) return -1;
+
+		fd_set wfds;
+		FD_ZERO(&wfds);
+		FD_SET(sock, &wfds);
+		struct timeval timeout = {0, 50*1000};
+		// No playback deadline: shutdown() makes a stalled socket writable.
+		if (select(sock + 1, NULL, &wfds, NULL, &timeout) < 0) {
+#if WIN
+			if (last_error() != WSAEINTR) return -1;
+#else
+			if (last_error() != EINTR) return -1;
+#endif
+		}
+	}
+	return size;
+}
+
+/*---------------------------------------------------------------------------*/
 int send_data(bool chunked, int sock, const void *data, int size, int flags) {
-	if (!chunked) return send(sock, data, size, flags);
+	if (!chunked) return send_all(sock, data, size, flags);
 
 	char chunk[16];
 	itoa(size, chunk, 16);
 	strcat(chunk, "\r\n");
 
-	send(sock, chunk, strlen(chunk), flags);
-	size = send(sock, data, size, flags);
-	send(sock, "\r\n", 2, flags);
+	if (send_all(sock, chunk, strlen(chunk), flags) < 0 ||
+		send_all(sock, data, size, flags) < 0 ||
+		send_all(sock, "\r\n", 2, flags) < 0) return -1;
 
 	return size;
 }
@@ -964,6 +998,8 @@ static void *http_thread_func(void *arg) {
 	int frame_count = 0;
 	raopst_t *ctx = (raopst_t*) arg;
 	int sock = -1;
+	uint8_t *send_buffer = NULL;
+	size_t send_size = 0;
 	struct timeval timeout = { 0, 0 };
 
 	while (ctx->running) {
@@ -1033,10 +1069,26 @@ static void *http_thread_func(void *arg) {
 		if (ctx->http_ready && (pcm = _buffer_get_frame(ctx, &bytes)) != NULL) {
 			size_t frames = bytes / 4;
 			uint8_t* data = encoder_encode(ctx->encoder, pcm, frames, &bytes);
+			// FLUSH can free the encoder's output while the mutex is released.
+			if (bytes > send_size) {
+				uint8_t *buffer = realloc(send_buffer, bytes);
+				if (!buffer) {
+					http_close(ctx, sock);
+					sock = -1;
+					ctx->close_socket = ctx->http_ready = false;
+					pthread_mutex_unlock(&ctx->ab_mutex);
+					continue;
+				}
+				send_buffer = buffer;
+				send_size = bytes;
+			}
+			if (bytes) memcpy(send_buffer, data, bytes);
+			data = send_buffer;
 
 			if (bytes) {
 				uint32_t space, gap = gettime_ms();
 				int offset;
+				bool sent_ok = true;
 
 #ifdef __RTP_STORE
 				fwrite(inbuf, len, 1, ctx->httpOUT);
@@ -1070,17 +1122,17 @@ static void *http_thread_func(void *arg) {
 
 					buffer[0] = len_16;
 
+					offset = ctx->icy.remain;
+					bytes -= offset;
+					ctx->icy.remain = ctx->icy.interval;
+
 					// release mutex here as send might take a while
 					pthread_mutex_unlock(&ctx->ab_mutex);
-
 					// send remaining data first
-					offset = ctx->icy.remain;
-					if (offset) send_data(ctx->http_length == -3, sock, data, offset, 0);
-					bytes -= offset;
+					if (offset) sent_ok = send_data(ctx->http_length == -3, sock, data, offset, 0) == offset;
 
 					// then send icy data
-					send_data(ctx->http_length == -3, sock, buffer, len_16 * 16 + 1, 0);
-					ctx->icy.remain = ctx->icy.interval;
+					if (sent_ok) sent_ok = send_data(ctx->http_length == -3, sock, buffer, len_16 * 16 + 1, 0) == len_16 * 16 + 1;
 
 					LOG_SDEBUG("[%p]: ICY checked %u", ctx, ctx->icy.remain);
 				} else {
@@ -1089,7 +1141,7 @@ static void *http_thread_func(void *arg) {
 				}
 
 				LOG_SDEBUG("[%p]: HTTP sent frame count:%u bytes:%u (W:%hu R:%hu)", ctx, frame_count++, bytes + offset, ctx->ab_write, ctx->ab_read);
-				ssize_t sent = send_data(ctx->http_length == -3, sock, data + offset , bytes, 0);
+				ssize_t sent = sent_ok ? send_data(ctx->http_length == -3, sock, data + offset, bytes, 0) : -1;
 
 				// update remaining count with desired length
 				if (ctx->icy.active) ctx->icy.remain -= bytes;
@@ -1102,6 +1154,11 @@ static void *http_thread_func(void *arg) {
 
 				if (sent != bytes) {
 					LOG_WARN("[%p]: HTTP send() unexpected response: %li (data=%i): %s", ctx, (long int) sent, bytes, strerror(errno));
+					pthread_mutex_lock(&ctx->ab_mutex);
+					http_close(ctx, sock);
+					sock = -1;
+					ctx->close_socket = ctx->http_ready = false;
+					pthread_mutex_unlock(&ctx->ab_mutex);
 				}
 			} else pthread_mutex_unlock(&ctx->ab_mutex);
 
@@ -1115,6 +1172,7 @@ static void *http_thread_func(void *arg) {
 	}
 
 	if (sock != -1) http_close(ctx, sock);
+	free(send_buffer);
 
 	LOG_INFO("[%p]: terminating", ctx);
 	return NULL;
@@ -1203,7 +1261,7 @@ static bool handle_http(raopst_t *ctx, int sock) {
 
 			if (sent < 0) {
 				LOG_ERROR("[%p]: error re-sending range %u", ctx, offset);
-				break;
+				return false;
 			}
 
 			count += sent;
@@ -1212,7 +1270,7 @@ static bool handle_http(raopst_t *ctx, int sock) {
 			if (ctx->icy.active) {
 				ctx->icy.remain -= sent;
 				if (!ctx->icy.remain) {
-					send_data(ctx->http_length == -3, sock, "", 1, 0);
+					if (send_data(ctx->http_length == -3, sock, "", 1, 0) != 1) return false;
 					ctx->icy.remain = ctx->icy.interval;
 				}
 			}
